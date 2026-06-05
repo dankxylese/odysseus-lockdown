@@ -1,0 +1,144 @@
+# Podman overrides — not tracked by upstream, survives git pull cleanly.
+# Local gitignore: .git/info/exclude
+#
+# Usage:
+#   podman compose -f docker-compose.yml -f docker-compose.podman.yml up -d --build
+#   podman compose -f docker-compose.yml -f docker-compose.podman.yml logs odysseus
+#
+# Daily pull (auto-pins a rollback tag before pulling):
+#   ./pin-pull.sh
+#
+# Rollback after a bad pull:
+#   git tag                               # list available pins
+#   git checkout pin-YYYY-MM-DD           # step back to that commit
+#   podman compose -f docker-compose.yml -f docker-compose.podman.yml up -d --build
+#   git checkout main                     # return to latest when ready
+#
+# Network isolation:
+#   default (internal: true) — inter-service only. chromadb, ntfy, and
+#     odysseus have zero direct internet access.
+#   internet — egress proxy (squid) only. odysseus reaches the internet
+#     exclusively via this proxy using HTTP_PROXY/HTTPS_PROXY, and Squid
+#     enforces the domain allowlist in security/squid.conf.
+#   searxng_web — searxng only; full internet for search engine queries.
+#
+# host.docker.internal / host.containers.internal entries still appear in
+# /etc/hosts (can't be removed via compose override) but are unreachable:
+# the default network has no gateway and the host is blocked by the
+# internal: true bridge. No host services are accessible.
+#
+# If your uid/gid differ from 1000, add PUID and PGID to your .env file:
+#   echo "PUID=$(id -u)" >> .env
+#   echo "PGID=$(id -g)" >> .env
+#
+# NVIDIA GPU — Podman uses CDI instead of docker runtime configuration.
+# One-time setup:
+#   sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+# Then uncomment the devices block below and remove COMPOSE_FILE from .env
+# (the base gpu.nvidia.yml overlay is Docker-only and not needed here).
+
+services:
+  odysseus:
+    volumes:
+      # Mount at the same path so absolute symlinks inside /opt/cuda resolve
+      # correctly inside the container (Arch's CUDA package uses absolute symlinks
+      # from lib64/ into targets/x86_64-linux/lib/; remounting at a different path
+      # would break them and cmake's find_library would fail to locate libcudart).
+      - /opt/cuda:/opt/cuda:ro
+      - /usr/include/cccl:/usr/include/cccl:ro
+    networks:
+      default: {}  # internal-only: reaches chromadb, ntfy, searxng, proxy
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN    # entrypoint chowns /app/data and /app/logs bind mounts
+      - SETUID   # gosu drops from root to PUID
+      - SETGID   # gosu drops from root to PGID
+    security_opt:
+      - no-new-privileges:true
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        ln -sfn /opt/cuda /usr/local/cuda
+        find /app/.local -name 'nvcc' -path '*/nvidia/*' 2>/dev/null | while read f; do
+          mv "$f" "${f}.disabled" 2>/dev/null || true
+        done
+        exec /usr/local/bin/entrypoint.sh "$@"
+      - sh
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7000"]
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - CUDA_HOME=/opt/cuda
+      - CUDA_PATH=/opt/cuda
+      - CUDAToolkit_ROOT=/opt/cuda
+      - PATH=/opt/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      - LD_LIBRARY_PATH=/opt/cuda/lib64:/opt/cuda/targets/x86_64-linux/lib
+      # Route all outbound internet through the squid egress proxy.
+      # pip, apt, huggingface_hub, requests, curl, and wget all honour these.
+      - HTTP_PROXY=http://proxy:3128
+      - HTTPS_PROXY=http://proxy:3128
+      - http_proxy=http://proxy:3128
+      - https_proxy=http://proxy:3128
+      # Internal services must NOT go through the proxy.
+      - NO_PROXY=chromadb,searxng,ntfy,proxy,localhost,127.0.0.1
+      - no_proxy=chromadb,searxng,ntfy,proxy,localhost,127.0.0.1
+    devices:
+      - nvidia.com/gpu=all
+    depends_on:
+      proxy:
+        condition: service_healthy
+
+  # Egress proxy — the sole container with internet access on the default network.
+  # Squid enforces the FQDN allowlist in security/squid.conf. Edit that file
+  # to add or remove allowed destinations; then restart this container.
+  proxy:
+    image: docker.io/ubuntu/squid:latest
+    entrypoint: ["sh", "/etc/squid/proxy-entrypoint.sh"]
+    volumes:
+      - ./security/squid.conf:/etc/squid/squid.conf:ro,z
+      - ./security/proxy-entrypoint.sh:/etc/squid/proxy-entrypoint.sh:ro,z
+      - ./security/logs:/var/log/squid:z
+    networks:
+      default: {}    # receives CONNECT/HTTP requests from odysseus
+      internet: {}   # the only path to the real internet
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/3128' 2>/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  # searxng gets its own external network so it can reach search engines
+  # directly without going through the allowlist proxy.
+  searxng:
+    networks:
+      default: {}      # odysseus reaches searxng here
+      searxng_web: {}  # internet for search queries (unrestricted)
+
+networks:
+  # Internal-only bridge — no gateway, no external routing.
+  # All services live here for inter-container communication.
+  # chromadb and ntfy are implicitly assigned here (base file specifies no
+  # explicit networks, so compose falls back to default).
+  default:
+    internal: true
+
+  # Proxy's internet-facing bridge. Only the squid container is on this
+  # network. Fixed subnet for easy identification in logs / future nftables.
+  internet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.89.10.0/24
+          gateway: 10.89.10.1
+
+  # Full-internet bridge for searxng only.
+  searxng_web:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.89.11.0/24
+          gateway: 10.89.11.1
