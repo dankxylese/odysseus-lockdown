@@ -1,3 +1,36 @@
+# odysseus-lockdown
+
+> **Fork of [pewdiepie-archdaemon/odysseus](https://github.com/pewdiepie-archdaemon/odysseus)** — hardened for self-hosted deployment with Podman and strict network isolation.
+
+## Why this fork exists
+
+Odysseus upstream is a vibe-coded project: fast-moving, experimental, and merged with minimal security review. That energy is great for features, but it also means any PR — intentional or not — can introduce code that runs on your server with access to your network, your files, and your AI API keys.
+
+The realistic threat surface includes:
+- **Remote code execution** via malicious tool handlers, scheduler actions, or agent loop escapes
+- **Botnet recruitment** — a compromised container silently joining C2 infrastructure
+- **Data exfiltration** — API keys, memory contents, documents, calendar and email data sent to attacker-controlled hosts
+- **Supply chain attacks** — a dependency or upstream PR quietly adding outbound callbacks
+
+This fork's goal is to make those attacks structurally harder by isolating the host from the container network and controlling what the app is allowed to reach out to, regardless of what the code inside it does.
+
+## Scope: local models only
+
+The egress allowlist is intentionally restrictive. **This fork is scoped to pure on-device LLM usage** — external AI API providers (OpenAI, Anthropic, OpenRouter, etc.) are not in the allowlist and will be blocked by the proxy.
+
+If you want to re-enable external API access, add the relevant domains to the `ACL_ALLOWED` list in [`security/squid.conf`](security/squid.conf). That file is the single place to manage what the app is permitted to reach.
+
+## What this fork adds
+
+- **Podman support** (`docker-compose.podman.yml`) — rootless container deployment using `podman-compose`, no Docker daemon required. Rootless means a container breakout does not yield root on the host.
+- **Egress lockdown** — all container outbound traffic is routed through a Squid proxy (`security/squid.conf`), with an explicit allowlist. Containers cannot reach arbitrary external hosts by default.
+- **Network monitoring** — the proxy logs all egress attempts, making it easy to audit what the app is actually calling out to and catch unexpected connections early.
+- **Claude Code knowledge base** (`claude/`) — structured documentation of the codebase for use with Claude Code, covering architecture, auth, tool system, memory, scheduling, integrations, and security.
+
+The rest of this README is the original upstream documentation.
+
+---
+
 # Odysseus
 
 ```
