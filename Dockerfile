@@ -20,6 +20,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gosu \
     && rm -rf /var/lib/apt/lists/*
 
+# Global install makes the package available to all users (npx cache is user-specific
+# and the build runs as root, but the container drops to PUID:PGID at runtime).
+RUN npm install -g @playwright/mcp@latest
+
 WORKDIR /app
 
 # Install Python deps first (layer cache). Optional extras (PyMuPDF AGPL, etc.)
